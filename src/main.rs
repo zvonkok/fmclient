@@ -149,13 +149,13 @@ fn parse_activate_with_vfs(input: &str) -> Result<(u32, Vec<ffi::FmPciDevice>), 
     Ok((partition_id, vfs))
 }
 
-fn output<T: serde::Serialize + std::fmt::Display>(value: &T, format: &OutputFormat) {
+fn output<T: serde::Serialize>(value: &T, table: &dyn std::fmt::Display, format: &OutputFormat) {
     match format {
         OutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(value).expect("serialization cannot fail")
         ),
-        OutputFormat::Table => print!("{value}"),
+        OutputFormat::Table => print!("{table}"),
     }
 }
 
@@ -178,7 +178,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     if cli.list {
-        output(&conn.list_partitions()?, &cli.output);
+        let list = conn.list_partitions()?;
+        output(&list, &types::Table(&list), &cli.output);
     } else if let Some(id) = cli.activate {
         conn.activate_partition(id)?;
     } else if let Some(id) = cli.deactivate {
@@ -187,9 +188,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let (id, vfs) = parse_activate_with_vfs(vf_str)?;
         conn.activate_partition_with_vfs(id, &vfs)?;
     } else if cli.list_unsupported {
-        output(&conn.list_unsupported_partitions()?, &cli.output);
+        let list = conn.list_unsupported_partitions()?;
+        output(&list, &types::Table(&list), &cli.output);
     } else if cli.nvlink_failed {
-        output(&conn.get_nvlink_failed_devices()?, &cli.output);
+        let devices = conn.get_nvlink_failed_devices()?;
+        output(&devices, &devices, &cli.output);
     } else if let Some(ref ids_str) = cli.set_activated {
         let ids = parse_partition_ids(ids_str)?;
         conn.set_activated_partitions(&ids)?;
