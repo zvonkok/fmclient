@@ -13,7 +13,7 @@ clap = { version = "4", features = ["derive"] }
 # pcilibs-rs; this client only fills it from the FM SDK and streams it with
 # the generated stubs.  No crates.io release yet; pinned to the fabric-grpc
 # head.
-pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "67118e9", default-features = false, features = ["fabric-grpc"] }
+pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "3994ae1", default-features = false, features = ["fabric-grpc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # dup/dup2 on the standard descriptors, see claim_stdout.
