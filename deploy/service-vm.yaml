@@ -35,8 +35,12 @@ spec:
         - name: fmclient
           # The tag carries the Fabric Manager version: libnvfm in the image
           # must match FM in the guest or connects fail with a version
-          # mismatch.
+          # mismatch.  No image is published yet; this is the name the
+          # release workflow will push.
           image: ghcr.io/zvonkok/fmclient:615
+          # The image's entrypoint is a shell; without this the flags below
+          # would reach bash, not fmclient.
+          command: ["fmclient"]
           args:
             - --publish
             # How the plugin hands out the GPUs of active partitions:
