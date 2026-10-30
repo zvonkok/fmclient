@@ -83,6 +83,29 @@ fmclient -t 60 -l
 fmclient -t 0 -l
 ```
 
+## Publishing the view to kata-device-plugin
+
+In shared NVSwitch mode the plugin on the host advertises each active
+partition as a schedulable unit. It learns the partitions from this client
+over a gRPC stream:
+
+```sh
+# In the Service VM container.  The plugin injected the endpoint and token
+# into this container's environment when it allocated the fabric.
+fmclient --publish
+
+# On the host, through the plugin's unix socket; no token there.
+fmclient --publish --publish-to unix:///var/run/kata-device-plugin/fabric-view.sock
+
+# Tell the plugin to hand out single GPUs instead of whole partitions.
+fmclient --publish --unit gpu
+```
+
+The lists are read every `--interval` seconds (default 5) and sent when
+they change, or every 30 seconds unchanged so the plugin can tell a quiet
+publisher from a dead one. A closed stream withdraws the view on the plugin
+side; this client reconnects with backoff. Log lines go to stderr.
+
 ## Running in Kata Containers / Service VMs
 
 With Kata Containers, the container runs inside a lightweight VM (the guest).

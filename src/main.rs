@@ -3,6 +3,7 @@
 
 mod ffi;
 mod fm;
+mod publish;
 mod types;
 
 use std::collections::BTreeSet;
@@ -83,6 +84,28 @@ struct Cli {
     /// Requires FABRIC_MODE_RESTART=1 in Fabric Manager configuration.
     #[arg(short = 'p', long = "set-activated-list", value_name = "IDS")]
     set_activated: Option<String>,
+
+    /// Publish the partition view to kata-device-plugin until stopped.
+    ///
+    /// Endpoint and token come from KATA_FABRIC_VIEW_ENDPOINT and
+    /// KATA_FABRIC_VIEW_TOKEN as the plugin injects them into the container
+    /// it gives the fabric to; --publish-to overrides the endpoint, which
+    /// is how a client on the host reaches the plugin's unix socket.
+    #[arg(long)]
+    publish: bool,
+
+    /// Endpoint to publish to: http://HOST:PORT or unix:///PATH.
+    #[arg(long = "publish-to", value_name = "ENDPOINT", requires = "publish")]
+    publish_to: Option<String>,
+
+    /// Seconds between reads of the partition lists while publishing.
+    #[arg(long, value_name = "SECS", default_value = "5")]
+    interval: u64,
+
+    /// How the GPUs of active partitions are to be consumed: "partition"
+    /// (one unit per active partition) or "gpu" (one unit per GPU).
+    #[arg(long, value_name = "UNIT", default_value = "partition")]
+    unit: String,
 
     /// Output format [possible: table, json]
     #[arg(
@@ -222,9 +245,54 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
     } else if let Some(ref ids_str) = cli.set_activated {
         let ids = parse_partition_ids(ids_str)?;
         conn.set_activated_partitions(&ids)?;
+    } else if cli.publish {
+        publish_forever(&conn, &cli)?;
     }
 
     Ok(())
+}
+
+/// The view is read on the runtime's thread between awaits: the SDK calls
+/// are short and the connection handle is not Send, so a single thread is
+/// the simplest correct shape.
+fn publish_forever(conn: &FmConnection, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    use pcilibs_rs::fabric::{self, v1::FabricView};
+
+    let unit = fabric::Unit::from_view(&cli.unit)
+        .ok_or_else(|| format!("--unit must be partition or gpu, got {:?}", cli.unit))?;
+    let target = publish::Target::from_vars(
+        cli.publish_to
+            .clone()
+            .or_else(|| std::env::var(fabric::ENDPOINT_ENV).ok()),
+        std::env::var(fabric::TOKEN_ENV).ok(),
+    )
+    .ok_or_else(|| format!("no endpoint: set {} or --publish-to", fabric::ENDPOINT_ENV))?;
+    let pacing = publish::Pacing {
+        poll: Duration::from_secs(cli.interval.max(1)),
+        ..publish::Pacing::default()
+    };
+    let mut source = || -> Result<FabricView, Box<dyn std::error::Error>> {
+        Ok(FabricView {
+            partitions: Some(conn.list_partitions()?),
+            unsupported: Some(conn.list_unsupported_partitions()?),
+            unit: unit.as_str().to_owned(),
+        })
+    };
+    let stop = tokio_util::sync::CancellationToken::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let on_signal = stop.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            on_signal.cancel();
+        });
+        publish::run(&target, &mut source, pacing, stop, &mut |line| {
+            eprintln!("fmclient: {line}")
+        })
+        .await
+    })
 }
 
 fn has_operation(cli: &Cli) -> bool {
@@ -235,6 +303,7 @@ fn has_operation(cli: &Cli) -> bool {
         || cli.nvlink_failed
         || cli.list_unsupported
         || cli.set_activated.is_some()
+        || cli.publish
 }
 
 fn main() -> ExitCode {
