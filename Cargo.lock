@@ -176,6 +176,7 @@ name = "fmclient"
 version = "2.0.0"
 dependencies = [
  "clap",
+ "libc",
  "pcilibs-rs",
  "serde",
  "serde_json",
