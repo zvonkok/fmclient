@@ -106,6 +106,17 @@ they change, or every 30 seconds unchanged so the plugin can tell a quiet
 publisher from a dead one. A closed stream withdraws the view on the plugin
 side; this client reconnects with backoff. Log lines go to stderr.
 
+## Deploying as the Service VM
+
+`deploy/service-vm.yaml` is the Service VM pod spec: a DaemonSet over the
+nodes whose fabric the provisioner bound, running this image under the Kata
+runtime class whose guest carries Fabric Manager, requesting
+`nvidia.com/nvswitch-fabric: 1` and publishing the view with `--publish`.
+The plugin injects the endpoint and token when it allocates the fabric.
+Activate partitions in-band with `kubectl exec ... -- fmclient -a <id>`; the
+plugin advertises each active partition within one poll. Pick `--unit=gpu`
+to have the plugin hand out single GPUs instead of whole partitions.
+
 ## Running in Kata Containers / Service VMs
 
 With Kata Containers, the container runs inside a lightweight VM (the guest).
