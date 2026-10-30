@@ -64,7 +64,10 @@ fmclient -l
 #    8      no     1    0/0          26562  2
 #  ...
 
-# List partitions as JSON
+# List partitions as JSON.  The schema is kata.fabric.v1 from pcilibs-rs,
+# the same types this client streams to kata-device-plugin, with fmpm's
+# field names: partitionInfo[].partitionId, isActive, gpuInfo[].physicalId.
+# Only JSON reaches stdout; libnvfm's own log lines go to stderr.
 fmclient -l -o json
 
 # Activate partition 3

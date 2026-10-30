@@ -5,6 +5,8 @@ use std::fmt;
 use std::ptr;
 use std::time::{Duration, Instant};
 
+use pcilibs_rs::fabric::v1;
+
 use crate::ffi;
 use crate::types;
 
@@ -142,22 +144,22 @@ impl FmConnection {
         }
     }
 
-    pub fn list_partitions(&self) -> Result<types::PartitionList, FmError> {
+    pub fn list_partitions(&self) -> Result<v1::PartitionList, FmError> {
         let mut list = unsafe { std::mem::zeroed::<ffi::FmFabricPartitionList>() };
         list.version = ffi::FmFabricPartitionList::version();
         FmError::from_return(unsafe {
             ffi::fmGetSupportedFabricPartitions(self.handle, &mut list)
         })?;
-        Ok(types::PartitionList::from(&list))
+        Ok(types::partition_list(&list))
     }
 
-    pub fn list_unsupported_partitions(&self) -> Result<types::UnsupportedPartitionList, FmError> {
+    pub fn list_unsupported_partitions(&self) -> Result<v1::UnsupportedPartitionList, FmError> {
         let mut list = unsafe { std::mem::zeroed::<ffi::FmUnsupportedFabricPartitionList>() };
         list.version = ffi::FmUnsupportedFabricPartitionList::version();
         FmError::from_return(unsafe {
             ffi::fmGetUnsupportedFabricPartitions(self.handle, &mut list)
         })?;
-        Ok(types::UnsupportedPartitionList::from(&list))
+        Ok(types::unsupported_partition_list(&list))
     }
 
     pub fn activate_partition(&self, partition_id: u32) -> Result<(), FmError> {

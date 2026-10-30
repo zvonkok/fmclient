@@ -6,6 +6,9 @@ mod fm;
 mod types;
 
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::FromRawFd;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -149,17 +152,40 @@ fn parse_activate_with_vfs(input: &str) -> Result<(u32, Vec<ffi::FmPciDevice>), 
     Ok((partition_id, vfs))
 }
 
-fn output<T: serde::Serialize + std::fmt::Display>(value: &T, format: &OutputFormat) {
+/// libnvfm logs to the process's stdout when it connects, whatever
+/// __FMLIB_LOG_LEVEL says, which corrupts `-o json` the moment it is piped
+/// or written to a file.  Give the library stderr as fd 1 and keep the
+/// real stdout for this program's output.  Called before the library is
+/// initialized and before any other thread exists.
+fn claim_stdout() -> std::io::Result<File> {
+    // SAFETY: fcntl and dup2 on the standard descriptors; the duplicate is
+    // owned by the returned File and closed with it.  The floor of 3 keeps
+    // the copy off the standard descriptors: with stderr closed, dup() would
+    // return 2 and the dup2 below would point stdout back at the original
+    // output, defeating the redirection; this way dup2 fails instead.
+    let saved = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if saved < 0 || unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(saved) })
+}
+
+fn output<T: types::Render>(
+    out: &mut File,
+    value: &T,
+    format: &OutputFormat,
+) -> std::io::Result<()> {
     match format {
-        OutputFormat::Json => println!(
+        OutputFormat::Json => writeln!(
+            out,
             "{}",
             serde_json::to_string_pretty(value).expect("serialization cannot fail")
         ),
-        OutputFormat::Table => print!("{value}"),
+        OutputFormat::Table => out.write_all(value.table().as_bytes()),
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
     let lib = FmLib::init()?;
 
     let address = if let Some(ref addr) = cli.vsock {
@@ -178,7 +204,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     if cli.list {
-        output(&conn.list_partitions()?, &cli.output);
+        let list = conn.list_partitions()?;
+        output(out, &list, &cli.output)?;
     } else if let Some(id) = cli.activate {
         conn.activate_partition(id)?;
     } else if let Some(id) = cli.deactivate {
@@ -187,9 +214,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let (id, vfs) = parse_activate_with_vfs(vf_str)?;
         conn.activate_partition_with_vfs(id, &vfs)?;
     } else if cli.list_unsupported {
-        output(&conn.list_unsupported_partitions()?, &cli.output);
+        let list = conn.list_unsupported_partitions()?;
+        output(out, &list, &cli.output)?;
     } else if cli.nvlink_failed {
-        output(&conn.get_nvlink_failed_devices()?, &cli.output);
+        let devices = conn.get_nvlink_failed_devices()?;
+        output(out, &devices, &cli.output)?;
     } else if let Some(ref ids_str) = cli.set_activated {
         let ids = parse_partition_ids(ids_str)?;
         conn.set_activated_partitions(&ids)?;
@@ -215,7 +244,14 @@ fn main() -> ExitCode {
         Cli::parse_from(["fmclient", "--help"]);
     }
 
-    match run(cli) {
+    let mut out = match claim_stdout() {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("error: cannot keep stdout for output: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match run(cli, &mut out) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
