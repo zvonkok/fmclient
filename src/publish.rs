@@ -5,11 +5,12 @@
 //!
 //! The plugin hosts the view's Publish stream and hands the one container it
 //! gives the fabric to an endpoint and a token through its environment
-//! ([`pcilibs_rs::fabric::ENDPOINT_ENV`], [`pcilibs_rs::fabric::TOKEN_ENV`]).  This client opens one stream, sends
-//! the view whenever Fabric Manager's lists change, resends it on a
-//! heartbeat so the plugin can tell a quiet publisher from a dead one, and
-//! reconnects with backoff when the stream ends.  The open stream is the
-//! plugin's liveness signal: it withdraws the view when the stream closes.
+//! ([`pcilibs_rs::fabric::ENDPOINT_ENV`], [`pcilibs_rs::fabric::TOKEN_ENV`]).
+//! This client opens one stream, sends the view whenever Fabric Manager's
+//! lists change, resends it on a heartbeat so the plugin can tell a quiet
+//! publisher from a dead one, and reconnects with backoff when the stream
+//! ends.  The open stream is the plugin's liveness signal: it withdraws the
+//! view when the stream closes.
 //!
 //! On the host the plugin also listens on a unix socket; `unix://<path>`
 //! selects it, and no token is needed there because the socket's
@@ -87,7 +88,11 @@ pub async fn run(
     let first_backoff = Duration::from_secs(1).min(pacing.backoff_max);
     let mut backoff = first_backoff;
     while !stop.is_cancelled() {
-        let channel = match connect(&target.endpoint).await {
+        let connected = tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            connected = connect(&target.endpoint) => connected,
+        };
+        let channel = match connected {
             Ok(channel) => channel,
             Err(e) => {
                 log(format!("connect {}: {e}", target.endpoint));
@@ -109,6 +114,10 @@ pub async fn run(
         let mut last: Option<FabricView> = None;
         let opened = tokio::time::Instant::now();
         let mut sent = opened;
+        // Sends never wait: with the stream's buffer full the send is skipped
+        // and the next tick retries it, so cancellation and the rpc keep
+        // being polled while the plugin is not draining.  A closed receiver
+        // means the rpc is ending; its arm reports why.
         let outcome = loop {
             tokio::select! {
                 _ = stop.cancelled() => break None,
@@ -121,18 +130,19 @@ pub async fn run(
                             continue;
                         }
                     };
-                    let changed = last.as_ref() != Some(&view);
-                    if changed || sent.elapsed() >= pacing.heartbeat {
-                        if tx.send(view.clone()).await.is_err() {
-                            // The receiver is gone: the rpc is ending and
-                            // reports why on the next turn.
-                            break Some(rpc.await);
-                        }
+                    if last.as_ref() != Some(&view) && tx.try_send(view.clone()).is_ok() {
                         sent = tokio::time::Instant::now();
-                        if changed {
-                            log(format!("view changed: {}", describe(&view)));
-                        }
+                        log(format!("view changed: {}", describe(&view)));
                         last = Some(view);
+                    }
+                }
+                // Independent of the poll, so a long --interval does not
+                // lengthen the silence the plugin tolerates.
+                _ = tokio::time::sleep_until(sent + pacing.heartbeat), if last.is_some() => {
+                    if let Some(view) = &last {
+                        if tx.try_send(view.clone()).is_ok() {
+                            sent = tokio::time::Instant::now();
+                        }
                     }
                 }
             }
@@ -185,18 +195,26 @@ fn describe(view: &FabricView) -> String {
 }
 
 /// HTTP/2 keepalives catch a plugin that vanished without closing, which the
-/// heartbeat alone would notice only on the next send.
+/// heartbeat alone would notice only on the next send; the connect timeout
+/// bounds an endpoint that drops packets, which the OS would otherwise let
+/// hang for minutes.
 async fn connect(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
     const KEEPALIVE: Duration = Duration::from_secs(10);
-    match endpoint.strip_prefix("unix://") {
+    let unix = endpoint.strip_prefix("unix://").map(str::to_owned);
+    // For a socket the URI is a placeholder: the connector ignores it and
+    // dials the path.
+    let uri = unix
+        .as_ref()
+        .map_or(endpoint, |_| "http://[::]:0")
+        .to_owned();
+    let endpoint = Endpoint::from_shared(uri)?
+        .connect_timeout(KEEPALIVE)
+        .http2_keep_alive_interval(KEEPALIVE)
+        .keep_alive_timeout(KEEPALIVE)
+        .keep_alive_while_idle(true);
+    match unix {
         Some(path) => {
-            let path = path.to_owned();
-            // The URI is a placeholder: the connector ignores it and dials
-            // the socket.
-            Endpoint::try_from("http://[::]:0")?
-                .http2_keep_alive_interval(KEEPALIVE)
-                .keep_alive_timeout(KEEPALIVE)
-                .keep_alive_while_idle(true)
+            endpoint
                 .connect_with_connector(service_fn(move |_: Uri| {
                     let path = path.clone();
                     async move {
@@ -207,14 +225,7 @@ async fn connect(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
                 }))
                 .await
         }
-        None => {
-            Endpoint::from_shared(endpoint.to_owned())?
-                .http2_keep_alive_interval(KEEPALIVE)
-                .keep_alive_timeout(KEEPALIVE)
-                .keep_alive_while_idle(true)
-                .connect()
-                .await
-        }
+        None => endpoint.connect().await,
     }
 }
 
@@ -436,6 +447,72 @@ mod tests {
         assert!(views.len() >= 3, "{}", views.len());
         assert!(views.iter().all(|v| *v == view("", &[1])));
         plugin.stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_does_not_wait_for_a_slow_poll() {
+        // A long poll interval must not lengthen the silence: the cached
+        // view is resent on the heartbeat without reading Fabric Manager.
+        let plugin = plugin("t", false).await;
+        let target = Target {
+            endpoint: plugin.endpoint.clone(),
+            token: Some("t".into()),
+        };
+        let reads = Arc::new(Mutex::new(0u32));
+        let counter = reads.clone();
+        let mut source = move || -> Result<FabricView, Box<dyn Error>> {
+            *counter.lock().unwrap() += 1;
+            Ok(view("", &[2]))
+        };
+        let pacing = Pacing {
+            poll: Duration::from_secs(60),
+            heartbeat: Duration::from_millis(40),
+            backoff_max: Duration::from_millis(100),
+        };
+        let stop = CancellationToken::new();
+        let waiter = plugin.recorder.clone();
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                waiter.got_one.notified().await;
+            }
+            stopper.cancel();
+        });
+        run(&target, &mut source, pacing, stop, &mut |_| {})
+            .await
+            .unwrap();
+        assert!(plugin.recorder.views.lock().unwrap().len() >= 3);
+        assert_eq!(*reads.lock().unwrap(), 1, "one poll, the rest heartbeats");
+        plugin.stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_a_connect_in_progress() {
+        // A listener that never accepts: connect() hangs until the timeout,
+        // and stop must still end run() at once.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deaf.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let target = Target {
+            endpoint: format!("unix://{}", path.display()),
+            token: None,
+        };
+        let mut source = || -> Result<FabricView, Box<dyn Error>> { Ok(view("", &[])) };
+        let stop = CancellationToken::new();
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stopper.cancel();
+        });
+        let started = tokio::time::Instant::now();
+        run(&target, &mut source, fast(), stop, &mut |_| {})
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
