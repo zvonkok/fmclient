@@ -1,0 +1,48 @@
+# The Service VM: one Kata pod per fabric node that holds the node's NVSwitch
+# fabric and publishes Fabric Manager's partition view to kata-device-plugin.
+#
+# The guest image runs Fabric Manager in shared NVSwitch mode (NVRC's
+# servicevm modes); this container only carries fmclient, which reaches FM
+# on the guest's loopback.  kata-device-plugin injects the view endpoint and
+# token into this container's environment when it allocates the fabric, so
+# nothing here names them.  Partitions are activated in-band:
+#
+#   kubectl -n kata-system exec ds/nvswitch-service-vm -- fmclient -l
+#   kubectl -n kata-system exec ds/nvswitch-service-vm -- fmclient -a 2
+#
+# and the plugin advertises each active partition within one poll.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvswitch-service-vm
+  namespace: kata-system
+spec:
+  selector:
+    matchLabels:
+      app: nvswitch-service-vm
+  template:
+    metadata:
+      labels:
+        app: nvswitch-service-vm
+    spec:
+      # The runtime class whose guest image carries Fabric Manager and NVRC.
+      runtimeClassName: kata-qemu-nvidia-gpu
+      # Only nodes whose fabric the provisioner bound for a Service VM; the
+      # label is the provisioner's NFD feature.
+      nodeSelector:
+        feature.node.kubernetes.io/managed-fabric: "true"
+      containers:
+        - name: fmclient
+          # The tag carries the Fabric Manager version: libnvfm in the image
+          # must match FM in the guest or connects fail with a version
+          # mismatch.
+          image: ghcr.io/zvonkok/fmclient:615
+          args:
+            - --publish
+            # How the plugin hands out the GPUs of active partitions:
+            # "partition" (one unit per partition, the default) or "gpu"
+            # (one unit per GPU, for an owner who holds the whole node).
+            - --unit=partition
+          resources:
+            limits:
+              nvidia.com/nvswitch-fabric: 1
