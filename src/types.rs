@@ -6,7 +6,7 @@
 //! The JSON rendering is serde's, so what this client prints is what it
 //! will stream.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::os::raw::c_char;
 
 use pcilibs_rs::fabric::v1;
@@ -73,24 +73,28 @@ pub fn unsupported_partition_list(
     }
 }
 
-/// A terminal rendering of a wire type, which cannot carry its own
-/// `Display`: the types are generated in another crate.
-pub struct Table<'a, T>(pub &'a T);
+/// What `-o json` and `-o table` print.  The wire types are generated in
+/// pcilibs-rs and cannot carry a `Display` of their own, so the table
+/// rendering is a trait implemented here, beside the conversions.
+pub trait Render: Serialize {
+    fn table(&self) -> String;
+}
 
-impl fmt::Display for Table<'_, v1::PartitionList> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let list = self.0;
-        writeln!(
+impl Render for v1::PartitionList {
+    fn table(&self) -> String {
+        let list = self;
+        let mut f = String::new();
+        let _ = writeln!(
             f,
             "Partitions ({} supported, max {}):\n",
             list.partition_info.len(),
             list.max_num_partitions
-        )?;
-        writeln!(
+        );
+        let _ = writeln!(
             f,
             "  {:>3}  {:>6}  {:>4}  {:>7}  {:>11}  GPU IDs",
             "ID", "Active", "GPUs", "NVLinks", "Rate (MB/s)"
-        )?;
+        );
         for p in &list.partition_info {
             let (avail, max, rate) = p.gpu_info.first().map_or((0, 0, 0), |g| {
                 (
@@ -99,7 +103,7 @@ impl fmt::Display for Table<'_, v1::PartitionList> {
                     g.nvlink_line_rate_mbps,
                 )
             });
-            writeln!(
+            let _ = writeln!(
                 f,
                 "  {:>3}  {:>6}  {:>4}  {:>3}/{:<3}  {:>11}  {}",
                 p.partition_id,
@@ -109,31 +113,38 @@ impl fmt::Display for Table<'_, v1::PartitionList> {
                 max,
                 rate,
                 ids(p.gpu_info.iter().map(|g| g.physical_id))
-            )?;
+            );
         }
-        Ok(())
+        f
     }
 }
 
-impl fmt::Display for Table<'_, v1::UnsupportedPartitionList> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let list = self.0;
-        writeln!(
+impl Render for v1::UnsupportedPartitionList {
+    fn table(&self) -> String {
+        let list = self;
+        let mut f = String::new();
+        let _ = writeln!(
             f,
             "Unsupported Partitions ({}):\n",
             list.partition_info.len()
-        )?;
-        writeln!(f, "  {:>3}  {:>4}  GPU IDs", "ID", "GPUs")?;
+        );
+        let _ = writeln!(f, "  {:>3}  {:>4}  GPU IDs", "ID", "GPUs");
         for p in &list.partition_info {
-            writeln!(
+            let _ = writeln!(
                 f,
                 "  {:>3}  {:>4}  {}",
                 p.partition_id,
                 p.gpu_physical_ids.len(),
                 ids(p.gpu_physical_ids.iter().copied())
-            )?;
+            );
         }
-        Ok(())
+        f
+    }
+}
+
+impl Render for NvlinkFailedDevices {
+    fn table(&self) -> String {
+        self.to_string()
     }
 }
 
@@ -302,7 +313,7 @@ mod tests {
 
     #[test]
     fn tables_read_like_fmpm() {
-        let table = Table(&partition_list(&sdk_partitions())).to_string();
+        let table = partition_list(&sdk_partitions()).table();
         assert!(
             table.starts_with("Partitions (2 supported, max 15):\n"),
             "{table}"
@@ -325,7 +336,7 @@ mod tests {
         unsupported.partition_info[0].gpu_physical_ids[1] = 5;
         let list = unsupported_partition_list(&unsupported);
         assert_eq!(list.partition_info[0].gpu_physical_ids, [7, 5]);
-        let table = Table(&list).to_string();
+        let table = list.table();
         assert!(table.contains("Unsupported Partitions (1):\n"), "{table}");
         assert!(table.contains("    5     2  7,5\n"), "{table}");
     }

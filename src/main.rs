@@ -181,19 +181,21 @@ fn parse_activate_with_vfs(input: &str) -> Result<(u32, Vec<ffi::FmPciDevice>), 
 /// real stdout for this program's output.  Called before the library is
 /// initialized and before any other thread exists.
 fn claim_stdout() -> std::io::Result<File> {
-    // SAFETY: dup and dup2 on the standard descriptors; the duplicate is
-    // owned by the returned File and closed with it.
-    let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    // SAFETY: fcntl and dup2 on the standard descriptors; the duplicate is
+    // owned by the returned File and closed with it.  The floor of 3 keeps
+    // the copy off the standard descriptors: with stderr closed, dup() would
+    // return 2 and the dup2 below would point stdout back at the original
+    // output, defeating the redirection; this way dup2 fails instead.
+    let saved = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
     if saved < 0 || unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(saved) })
 }
 
-fn output<T: serde::Serialize>(
+fn output<T: types::Render>(
     out: &mut File,
     value: &T,
-    table: &dyn std::fmt::Display,
     format: &OutputFormat,
 ) -> std::io::Result<()> {
     match format {
@@ -202,7 +204,7 @@ fn output<T: serde::Serialize>(
             "{}",
             serde_json::to_string_pretty(value).expect("serialization cannot fail")
         ),
-        OutputFormat::Table => write!(out, "{table}"),
+        OutputFormat::Table => out.write_all(value.table().as_bytes()),
     }
 }
 
@@ -226,7 +228,7 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.list {
         let list = conn.list_partitions()?;
-        output(out, &list, &types::Table(&list), &cli.output)?;
+        output(out, &list, &cli.output)?;
     } else if let Some(id) = cli.activate {
         conn.activate_partition(id)?;
     } else if let Some(id) = cli.deactivate {
@@ -236,10 +238,10 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
         conn.activate_partition_with_vfs(id, &vfs)?;
     } else if cli.list_unsupported {
         let list = conn.list_unsupported_partitions()?;
-        output(out, &list, &types::Table(&list), &cli.output)?;
+        output(out, &list, &cli.output)?;
     } else if cli.nvlink_failed {
         let devices = conn.get_nvlink_failed_devices()?;
-        output(out, &devices, &devices, &cli.output)?;
+        output(out, &devices, &cli.output)?;
     } else if let Some(ref ids_str) = cli.set_activated {
         let ids = parse_partition_ids(ids_str)?;
         conn.set_activated_partitions(&ids)?;
