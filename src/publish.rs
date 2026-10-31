@@ -132,7 +132,7 @@ pub async fn run(
                     };
                     if last.as_ref() != Some(&view) && tx.try_send(view.clone()).is_ok() {
                         sent = tokio::time::Instant::now();
-                        log(format!("view changed: {}", describe(&view)));
+                        log(format!("view changed: {view}"));
                         last = Some(view);
                     }
                 }
@@ -172,26 +172,6 @@ async fn pause(duration: Duration, stop: &CancellationToken) {
         _ = stop.cancelled() => {}
         _ = tokio::time::sleep(duration) => {}
     }
-}
-
-/// One line for the log: active partitions and their sizes.
-fn describe(view: &FabricView) -> String {
-    let active: Vec<String> = view
-        .partitions
-        .iter()
-        .flat_map(|list| list.partition_info.iter())
-        .filter(|partition| partition.is_active)
-        .map(|partition| format!("{}x{}", partition.partition_id, partition.gpu_info.len()))
-        .collect();
-    format!(
-        "unit {:?}, active partitions (id x gpus): {}",
-        view.unit,
-        if active.is_empty() {
-            "none".to_owned()
-        } else {
-            active.join(" ")
-        }
-    )
 }
 
 /// HTTP/2 keepalives catch a plugin that vanished without closing, which the
@@ -357,18 +337,6 @@ mod tests {
                 .unwrap()
                 .token,
             Some("t".into())
-        );
-    }
-
-    #[test]
-    fn describe_names_active_partitions() {
-        assert_eq!(
-            describe(&view("gpu", &[])),
-            "unit \"gpu\", active partitions (id x gpus): none"
-        );
-        assert_eq!(
-            describe(&view("", &[2, 6])),
-            "unit \"\", active partitions (id x gpus): 2x2 6x2"
         );
     }
 
