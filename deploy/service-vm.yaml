@@ -30,7 +30,7 @@ spec:
       # Only nodes whose fabric the provisioner bound for a Service VM; the
       # label is the provisioner's NFD feature.
       nodeSelector:
-        feature.node.kubernetes.io/managed-fabric: "true"
+        kata.feature.node.kubernetes.io/managed-fabric: "true"
       containers:
         - name: fmclient
           # The tag carries the Fabric Manager version: libnvfm in the image
