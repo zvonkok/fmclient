@@ -177,29 +177,35 @@ FM_CMD_VSOCK_PORT_NUMBER=1447971919
 `VMADDR_CID_ANY` (`4294967295`) allows FM to accept vsock connections from
 any source, including the host.
 
-#### Finding the guest CID
+#### The Service VM over vsock (out-of-band)
 
-The guest CID is assigned by the hypervisor. From the host:
+With kata runtime-rs the Service VM gets a fixed CID through the
+`io.katacontainers.config.hypervisor.vsock_cid` annotation, and NVRC turns
+FM's vsock listener on when the kernel command line carries
+`nvrc.fm.vsock=on`. `deploy/service-vm-out-of-band.yaml` sets both; its
+container only holds the fabric, the host does the rest. The runtime-rs
+NVIDIA shim has no shared filesystem, so its pods need containerd's erofs
+snapshotter, which kata-deploy's `try-kata-nvidia-gpu.values.yaml` profile
+configures (`erofs-utils` on the host).
 
 ```sh
-# From QEMU process arguments (Kata uses QEMU under the hood)
-ps aux | grep qemu | grep -o 'guest-cid=[0-9]*'
-# guest-cid=4273709585
+# the view, on the plugin's host socket; no token, the socket's permissions decide
+fmclient --vsock --publish --publish-to unix:///var/run/kata-device-plugin/fabric-view.sock
+
+# partitions, from the host
+fmclient --vsock -l
+fmclient --vsock -a 2
 ```
 
-#### Connecting via vsock
+`--vsock` without a value is the contract address: pcilibs-rs
+`fabric::SERVICE_VM_CID` (3, the first CID kata reserves for configured VMs)
+and FM's default port. Give `CID:PORT` for anything else.
 
-```sh
-fmclient -v 4273709585:1447971919 -l
-```
-
-#### Limitations with Kata Containers
-
-vsock requires `FM_CMD_VSOCK_CID` to be set in the guest rootfs before boot.
-With Kata Containers, the guest rootfs is managed by the runtime and not
-easily modified at container launch time. This means vsock support must be
-baked into the guest image during the image build process. If you don't
-control the guest image, use TCP with port forwarding instead.
+A vsock connect needs no privilege on the host, so with the listener on every
+host process can reach the FM API. That is the provider-owned model; where the
+host must have no Fabric Manager control path, run the in-band manifest, whose
+guest opens nothing. Never run both on one node: the plugin keeps the newer
+stream and ends the other.
 
 ## Fabric Manager Configuration Reference
 
