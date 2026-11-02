@@ -213,13 +213,16 @@ fn output<T: types::Render>(
 fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
     let lib = FmLib::init()?;
 
-    let service_vm = format!(
-        "{}:{}",
-        pcilibs_rs::fabric::SERVICE_VM_CID,
-        pcilibs_rs::fabric::FM_VSOCK_PORT
-    );
+    let service_vm;
     let address = if let Some(ref vsock) = cli.vsock {
-        FmAddress::Vsock(vsock.as_deref().unwrap_or(&service_vm))
+        service_vm = vsock.clone().unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                pcilibs_rs::fabric::SERVICE_VM_CID,
+                pcilibs_rs::fabric::FM_VSOCK_PORT
+            )
+        });
+        FmAddress::Vsock(&service_vm)
     } else if let Some(ref path) = cli.unix_socket {
         FmAddress::Unix(path)
     } else {
