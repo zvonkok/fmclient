@@ -76,35 +76,55 @@ impl Default for Pacing {
 
 /// Reads the view from Fabric Manager.  An error is logged and the read
 /// retried at the next poll; the stream stays open meanwhile.
-pub type Source<'a> = dyn FnMut() -> Result<FabricView, Box<dyn Error>> + 'a;
+/// One reading of Fabric Manager's lists, or why there is none.
+pub type Reading = Result<FabricView, String>;
 
-/// Publish until `stop` is cancelled.  Returns early only for a token that
-/// is not valid gRPC metadata, which no plugin issues: retrying cannot fix
-/// it.
+/// Read `source` every `interval` and hand each reading to the publisher,
+/// until the publisher is gone.  Meant for a thread of its own: the SDK
+/// calls block, and a slow one must not stall the stream's keepalive
+/// answers, which the plugin takes as the publisher being dead.
+pub fn read_forever(
+    mut source: impl FnMut() -> Result<FabricView, Box<dyn Error>>,
+    interval: Duration,
+    readings: mpsc::Sender<Reading>,
+) {
+    loop {
+        let reading = source().map_err(|e| e.to_string());
+        if readings.blocking_send(reading).is_err() {
+            return;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Publish until `stop` is cancelled.  Returns early for a token that is
+/// not valid gRPC metadata, which no plugin issues, and for a reader that
+/// ended: retrying cannot fix either.
 pub async fn run(
     target: &Target,
-    source: &mut Source<'_>,
+    mut readings: mpsc::Receiver<Reading>,
     pacing: Pacing,
     stop: CancellationToken,
     log: &mut dyn FnMut(String),
 ) -> Result<(), Box<dyn Error>> {
     let first_backoff = Duration::from_secs(1).min(pacing.backoff_max);
     let mut backoff = first_backoff;
+    // A view not refreshed within this is withdrawn: one heartbeat, or two
+    // readings when the reader is slower than that.  Fail-closed covers a
+    // reader that fails and one that stalls alike.
+    let stale_after = pacing.heartbeat.max(pacing.poll * 2);
     while !stop.is_cancelled() {
         // No stream without a view: an open stream tells the plugin the view
-        // is current, which a publisher that cannot read Fabric Manager
-        // cannot say.
+        // is current, which a publisher without a reading cannot say.
         let (first, mut answered) = loop {
-            match source() {
-                Ok(view) => break (view, tokio::time::Instant::now()),
-                Err(e) => {
-                    log(format!("fabric manager: {e}"));
-                    pause(backoff, &stop).await;
-                    if stop.is_cancelled() {
-                        return Ok(());
-                    }
-                    backoff = (backoff * 2).min(pacing.backoff_max);
-                }
+            let reading = tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                reading = readings.recv() => reading,
+            };
+            match reading {
+                Some(Ok(view)) => break (view, tokio::time::Instant::now()),
+                Some(Err(e)) => log(format!("fabric manager: {e}")),
+                None => return Err("the fabric manager reader ended".into()),
             }
         };
         let connected = tokio::select! {
@@ -129,14 +149,10 @@ pub async fn run(
         let mut rpc = Box::pin(client.publish(request));
         log(format!("publishing to {}", target.endpoint));
 
-        let mut ticker = tokio::time::interval(pacing.poll);
-        // The interval's first tick is immediate; the view in hand is current.
-        ticker.tick().await;
         let opened = tokio::time::Instant::now();
         let mut sent = opened;
-        // Whether the last read failed: the stream then has until one
-        // heartbeat after `answered`, and the heartbeat stops resending a
-        // view that may be stale.
+        // Whether the last reading failed: the heartbeat then stops
+        // resending a view that may be stale.
         let mut failing = false;
         let mut last: Option<FabricView> = None;
         if tx.try_send(first.clone()).is_ok() {
@@ -144,36 +160,31 @@ pub async fn run(
             last = Some(first);
         }
         // Sends never wait: with the stream's buffer full the send is skipped
-        // and the next tick retries it, so cancellation and the rpc keep
+        // and the next reading retries it, so cancellation and the rpc keep
         // being polled while the plugin is not draining.  A closed receiver
         // means the rpc is ending; its arm reports why.
         let outcome = loop {
             tokio::select! {
                 _ = stop.cancelled() => break Outcome::Stopped,
                 result = &mut rpc => break Outcome::Ended(result.map(drop)),
-                _ = ticker.tick() => {
-                    let view = match source() {
-                        Ok(view) => view,
-                        Err(e) => {
-                            log(format!("fabric manager: {e}"));
-                            failing = true;
-                            continue;
-                        }
-                    };
-                    answered = tokio::time::Instant::now();
-                    failing = false;
-                    if last.as_ref() != Some(&view) && tx.try_send(view.clone()).is_ok() {
-                        sent = tokio::time::Instant::now();
-                        log(format!("view changed: {view}"));
-                        last = Some(view);
+                reading = readings.recv() => match reading {
+                    None => break Outcome::ReaderGone,
+                    Some(Err(e)) => {
+                        log(format!("fabric manager: {e}"));
+                        failing = true;
                     }
-                }
-                // Independent of the poll, so a long --interval does not
-                // lengthen the silence the publisher tolerates.
-                _ = tokio::time::sleep_until(answered + pacing.heartbeat), if failing => {
-                    break Outcome::Unanswered;
-                }
-                // Independent of the poll, so a long --interval does not
+                    Some(Ok(view)) => {
+                        answered = tokio::time::Instant::now();
+                        failing = false;
+                        if last.as_ref() != Some(&view) && tx.try_send(view.clone()).is_ok() {
+                            sent = tokio::time::Instant::now();
+                            log(format!("view changed: {view}"));
+                            last = Some(view);
+                        }
+                    }
+                },
+                _ = tokio::time::sleep_until(answered + stale_after) => break Outcome::Unanswered,
+                // Independent of the readings, so a long --interval does not
                 // lengthen the silence the plugin tolerates.
                 _ = tokio::time::sleep_until(sent + pacing.heartbeat), if last.is_some() && !failing => {
                     if let Some(view) = &last {
@@ -187,11 +198,11 @@ pub async fn run(
         drop(tx);
         match outcome {
             Outcome::Stopped => return Ok(()),
+            Outcome::ReaderGone => return Err("the fabric manager reader ended".into()),
             Outcome::Ended(Ok(())) => log("stream closed by the plugin".to_owned()),
             Outcome::Ended(Err(status)) => log(format!("stream ended: {status}")),
             Outcome::Unanswered => log(format!(
-                "fabric manager unanswered for {:?}: closing the stream",
-                pacing.heartbeat
+                "fabric manager unanswered for {stale_after:?}: closing the stream"
             )),
         }
         // A queued view proves nothing, the plugin may have refused the
@@ -215,6 +226,8 @@ enum Outcome {
     Ended(Result<(), tonic::Status>),
     /// Fabric Manager stopped answering; this side closed it.
     Unanswered,
+    /// The reader thread is gone; nothing will ever answer.
+    ReaderGone,
 }
 
 async fn pause(duration: Duration, stop: &CancellationToken) {
@@ -363,6 +376,16 @@ mod tests {
         }
     }
 
+    /// A reader thread over a source, as main runs it.
+    fn reader(
+        source: impl FnMut() -> Result<FabricView, Box<dyn Error>> + Send + 'static,
+        poll: Duration,
+    ) -> mpsc::Receiver<Reading> {
+        let (tx, rx) = mpsc::channel(1);
+        std::thread::spawn(move || read_forever(source, poll, tx));
+        rx
+    }
+
     fn fast() -> Pacing {
         Pacing {
             poll: Duration::from_millis(20),
@@ -403,7 +426,7 @@ mod tests {
         let reads = Arc::new(Mutex::new(0u32));
         let counter = reads.clone();
         // The same view three times, then a different one.
-        let mut source = move || -> Result<FabricView, Box<dyn Error>> {
+        let source = move || -> Result<FabricView, Box<dyn Error>> {
             let mut n = counter.lock().unwrap();
             *n += 1;
             Ok(if *n <= 3 {
@@ -421,9 +444,13 @@ mod tests {
             waiter.got_one.notified().await;
             stopper.cancel();
         });
-        run(&target, &mut source, fast(), stop, &mut |line| {
-            log.push(line)
-        })
+        run(
+            &target,
+            reader(source, fast().poll),
+            fast(),
+            stop,
+            &mut |line| log.push(line),
+        )
         .await
         .unwrap();
         let views = plugin.recorder.views.lock().unwrap().clone();
@@ -447,7 +474,7 @@ mod tests {
             endpoint: plugin.endpoint.clone(),
             token: Some("t".into()),
         };
-        let mut source = || -> Result<FabricView, Box<dyn Error>> { Ok(view("", &[1])) };
+        let source = || -> Result<FabricView, Box<dyn Error>> { Ok(view("", &[1])) };
         let pacing = Pacing {
             heartbeat: Duration::from_millis(50),
             ..fast()
@@ -461,9 +488,15 @@ mod tests {
             }
             stopper.cancel();
         });
-        run(&target, &mut source, pacing, stop, &mut |_| {})
-            .await
-            .unwrap();
+        run(
+            &target,
+            reader(source, pacing.poll),
+            pacing,
+            stop,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
         let views = plugin.recorder.views.lock().unwrap();
         assert!(views.len() >= 3, "{}", views.len());
         assert!(views.iter().all(|v| *v == view("", &[1])));
@@ -481,7 +514,7 @@ mod tests {
         };
         let reads = Arc::new(Mutex::new(0u32));
         let counter = reads.clone();
-        let mut source = move || -> Result<FabricView, Box<dyn Error>> {
+        let source = move || -> Result<FabricView, Box<dyn Error>> {
             *counter.lock().unwrap() += 1;
             Ok(view("", &[2]))
         };
@@ -499,9 +532,15 @@ mod tests {
             }
             stopper.cancel();
         });
-        run(&target, &mut source, pacing, stop, &mut |_| {})
-            .await
-            .unwrap();
+        run(
+            &target,
+            reader(source, pacing.poll),
+            pacing,
+            stop,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
         assert!(plugin.recorder.views.lock().unwrap().len() >= 3);
         assert_eq!(*reads.lock().unwrap(), 1, "one poll, the rest heartbeats");
         plugin.stop.cancel();
@@ -518,7 +557,7 @@ mod tests {
             endpoint: format!("unix://{}", path.display()),
             token: None,
         };
-        let mut source = || -> Result<FabricView, Box<dyn Error>> { Ok(view("", &[])) };
+        let source = || -> Result<FabricView, Box<dyn Error>> { Ok(view("", &[])) };
         let stop = CancellationToken::new();
         let stopper = stop.clone();
         tokio::spawn(async move {
@@ -526,9 +565,15 @@ mod tests {
             stopper.cancel();
         });
         let started = tokio::time::Instant::now();
-        run(&target, &mut source, fast(), stop, &mut |_| {})
-            .await
-            .unwrap();
+        run(
+            &target,
+            reader(source, fast().poll),
+            fast(),
+            stop,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "{:?}",
@@ -543,7 +588,7 @@ mod tests {
             endpoint: plugin.endpoint.clone(),
             token: Some("t".into()),
         };
-        let mut source = || -> Result<FabricView, Box<dyn Error>> { Ok(view("", &[4])) };
+        let source = || -> Result<FabricView, Box<dyn Error>> { Ok(view("", &[4])) };
         let stop = CancellationToken::new();
         let mut log = Vec::new();
         let waiter = plugin.recorder.clone();
@@ -553,9 +598,13 @@ mod tests {
             waiter.got_one.notified().await;
             stopper.cancel();
         });
-        run(&target, &mut source, fast(), stop, &mut |line| {
-            log.push(line)
-        })
+        run(
+            &target,
+            reader(source, fast().poll),
+            fast(),
+            stop,
+            &mut |line| log.push(line),
+        )
         .await
         .unwrap();
         assert!(plugin.recorder.views.lock().unwrap().len() >= 2);
@@ -579,7 +628,7 @@ mod tests {
             endpoint: plugin.endpoint.clone(),
             token: Some("wrong".into()),
         };
-        let mut source = || -> Result<FabricView, Box<dyn Error>> { Ok(view("", &[1])) };
+        let source = || -> Result<FabricView, Box<dyn Error>> { Ok(view("", &[1])) };
         let stop = CancellationToken::new();
         let mut log = Vec::new();
         let stopper = stop.clone();
@@ -587,9 +636,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             stopper.cancel();
         });
-        run(&target, &mut source, fast(), stop, &mut |line| {
-            log.push(line)
-        })
+        run(
+            &target,
+            reader(source, fast().poll),
+            fast(),
+            stop,
+            &mut |line| log.push(line),
+        )
         .await
         .unwrap();
         assert!(plugin.recorder.views.lock().unwrap().is_empty());
@@ -608,9 +661,10 @@ mod tests {
             endpoint: format!("unix://{}", dir.path().join("absent.sock").display()),
             token: None,
         };
-        let mut reads = 0;
-        let mut source = || -> Result<FabricView, Box<dyn Error>> {
-            reads += 1;
+        let reads = Arc::new(Mutex::new(0u32));
+        let counter = reads.clone();
+        let source = move || -> Result<FabricView, Box<dyn Error>> {
+            *counter.lock().unwrap() += 1;
             Ok(view("", &[]))
         };
         let stop = CancellationToken::new();
@@ -620,9 +674,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(250)).await;
             stopper.cancel();
         });
-        run(&target, &mut source, fast(), stop, &mut |line| {
-            log.push(line)
-        })
+        run(
+            &target,
+            reader(source, fast().poll),
+            fast(),
+            stop,
+            &mut |line| log.push(line),
+        )
         .await
         .unwrap();
         assert!(
@@ -632,7 +690,10 @@ mod tests {
                 >= 2,
             "{log:?}"
         );
-        assert!(reads >= 1, "the view in hand is read before each connect");
+        assert!(
+            *reads.lock().unwrap() >= 1,
+            "the reader runs without a stream"
+        );
     }
 
     #[tokio::test]
@@ -645,7 +706,7 @@ mod tests {
         // The second read, the first one inside the stream, fails; the
         // heartbeat is far away, so the stream stays and the next read sends.
         let mut n = 0;
-        let mut source = move || -> Result<FabricView, Box<dyn Error>> {
+        let source = move || -> Result<FabricView, Box<dyn Error>> {
             n += 1;
             if n == 2 {
                 Err("fm unavailable".into())
@@ -662,9 +723,13 @@ mod tests {
             waiter.got_one.notified().await;
             stopper.cancel();
         });
-        run(&target, &mut source, fast(), stop, &mut |line| {
-            log.push(line)
-        })
+        run(
+            &target,
+            reader(source, fast().poll),
+            fast(),
+            stop,
+            &mut |line| log.push(line),
+        )
         .await
         .unwrap();
         assert!(
@@ -695,7 +760,7 @@ mod tests {
         // test moves it between those as it observes the stream.
         let phase = Arc::new(Mutex::new(Some(view("", &[1]))));
         let fm = phase.clone();
-        let mut source = move || -> Result<FabricView, Box<dyn Error>> {
+        let source = move || -> Result<FabricView, Box<dyn Error>> {
             fm.lock()
                 .unwrap()
                 .clone()
@@ -723,9 +788,13 @@ mod tests {
             }
             stopper.cancel();
         });
-        run(&target, &mut source, pacing, stop, &mut |line| {
-            log.push(line)
-        })
+        run(
+            &target,
+            reader(source, pacing.poll),
+            pacing,
+            stop,
+            &mut |line| log.push(line),
+        )
         .await
         .unwrap();
         assert!(
@@ -754,7 +823,7 @@ mod tests {
             token: Some("t".into()),
         };
         let mut n = 0;
-        let mut source = move || -> Result<FabricView, Box<dyn Error>> {
+        let source = move || -> Result<FabricView, Box<dyn Error>> {
             n += 1;
             if n <= 2 {
                 Err("fm not up".into())
@@ -770,9 +839,13 @@ mod tests {
             waiter.got_one.notified().await;
             stopper.cancel();
         });
-        run(&target, &mut source, fast(), stop, &mut |line| {
-            log.push(line)
-        })
+        run(
+            &target,
+            reader(source, fast().poll),
+            fast(),
+            stop,
+            &mut |line| log.push(line),
+        )
         .await
         .unwrap();
         let first_error = log.iter().position(|l| l == "fabric manager: fm not up");
