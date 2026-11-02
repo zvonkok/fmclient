@@ -256,7 +256,7 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
         let ids = parse_partition_ids(ids_str)?;
         conn.set_activated_partitions(&ids)?;
     } else if cli.publish {
-        publish_forever(&conn, &cli)?;
+        publish_forever(&lib, address, conn, &cli)?;
     }
 
     Ok(())
@@ -265,7 +265,12 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
 /// The view is read on the runtime's thread between awaits: the SDK calls
 /// are short and the connection handle is not Send, so a single thread is
 /// the simplest correct shape.
-fn publish_forever(conn: &FmConnection, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn publish_forever(
+    lib: &FmLib,
+    address: FmAddress<'_>,
+    conn: FmConnection,
+    cli: &Cli,
+) -> Result<(), Box<dyn std::error::Error>> {
     use pcilibs_rs::fabric::{self, v1::FabricView};
 
     let unit = fabric::Unit::from_view(&cli.unit)
@@ -281,12 +286,38 @@ fn publish_forever(conn: &FmConnection, cli: &Cli) -> Result<(), Box<dyn std::er
         poll: Duration::from_secs(cli.interval.max(1)),
         ..publish::Pacing::default()
     };
+    // Fabric Manager restarts with its Service VM and the SDK handle does not
+    // survive that: a failed read drops the handle and the next read connects
+    // anew, in one attempt, so a poll blocks the stream for the SDK's connect
+    // timeout at most.
+    let mut connection = Some(conn);
     let mut source = || -> Result<FabricView, Box<dyn std::error::Error>> {
-        Ok(FabricView {
-            partitions: Some(conn.list_partitions()?),
-            unsupported: Some(conn.list_unsupported_partitions()?),
-            unit: unit.as_str().to_owned(),
-        })
+        if connection.is_none() {
+            connection = Some(FmConnection::connect(
+                lib,
+                address,
+                DEFAULT_TIMEOUT_MS,
+                Duration::ZERO,
+            )?);
+        }
+        let read = {
+            let conn = connection.as_ref().expect("connected above");
+            conn.list_partitions().and_then(|partitions| {
+                conn.list_unsupported_partitions()
+                    .map(|unsupported| (partitions, unsupported))
+            })
+        };
+        match read {
+            Ok((partitions, unsupported)) => Ok(FabricView {
+                partitions: Some(partitions),
+                unsupported: Some(unsupported),
+                unit: unit.as_str().to_owned(),
+            }),
+            Err(e) => {
+                connection = None;
+                Err(e.into())
+            }
+        }
     };
     let stop = tokio_util::sync::CancellationToken::new();
     let runtime = tokio::runtime::Builder::new_current_thread()

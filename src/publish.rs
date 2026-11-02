@@ -10,7 +10,10 @@
 //! lists change, resends it on a heartbeat so the plugin can tell a quiet
 //! publisher from a dead one, and reconnects with backoff when the stream
 //! ends.  The open stream is the plugin's liveness signal: it withdraws the
-//! view when the stream closes.
+//! view when the stream closes.  So the stream opens only with a view in
+//! hand, and it is closed when Fabric Manager has not answered for a
+//! heartbeat: a view the publisher cannot refresh is withdrawn rather than
+//! kept alive, and publishing resumes once Fabric Manager answers again.
 //!
 //! On the host the plugin also listens on a unix socket; `unix://<path>`
 //! selects it, and no token is needed there because the socket's
@@ -88,6 +91,22 @@ pub async fn run(
     let first_backoff = Duration::from_secs(1).min(pacing.backoff_max);
     let mut backoff = first_backoff;
     while !stop.is_cancelled() {
+        // No stream without a view: an open stream tells the plugin the view
+        // is current, which a publisher that cannot read Fabric Manager
+        // cannot say.
+        let first = loop {
+            match source() {
+                Ok(view) => break view,
+                Err(e) => {
+                    log(format!("fabric manager: {e}"));
+                    pause(backoff, &stop).await;
+                    if stop.is_cancelled() {
+                        return Ok(());
+                    }
+                    backoff = (backoff * 2).min(pacing.backoff_max);
+                }
+            }
+        };
         let connected = tokio::select! {
             _ = stop.cancelled() => return Ok(()),
             connected = connect(&target.endpoint) => connected,
@@ -111,25 +130,38 @@ pub async fn run(
         log(format!("publishing to {}", target.endpoint));
 
         let mut ticker = tokio::time::interval(pacing.poll);
-        let mut last: Option<FabricView> = None;
+        // The interval's first tick is immediate; the view in hand is current.
+        ticker.tick().await;
         let opened = tokio::time::Instant::now();
         let mut sent = opened;
+        // When Fabric Manager last answered; the stream outlives a silence
+        // of one heartbeat and no longer.
+        let mut answered = opened;
+        let mut last: Option<FabricView> = None;
+        if tx.try_send(first.clone()).is_ok() {
+            log(format!("view changed: {first}"));
+            last = Some(first);
+        }
         // Sends never wait: with the stream's buffer full the send is skipped
         // and the next tick retries it, so cancellation and the rpc keep
         // being polled while the plugin is not draining.  A closed receiver
         // means the rpc is ending; its arm reports why.
         let outcome = loop {
             tokio::select! {
-                _ = stop.cancelled() => break None,
-                result = &mut rpc => break Some(result),
+                _ = stop.cancelled() => break Outcome::Stopped,
+                result = &mut rpc => break Outcome::Ended(result.map(drop)),
                 _ = ticker.tick() => {
                     let view = match source() {
                         Ok(view) => view,
                         Err(e) => {
                             log(format!("fabric manager: {e}"));
+                            if answered.elapsed() >= pacing.heartbeat {
+                                break Outcome::Unanswered;
+                            }
                             continue;
                         }
                     };
+                    answered = tokio::time::Instant::now();
                     if last.as_ref() != Some(&view) && tx.try_send(view.clone()).is_ok() {
                         sent = tokio::time::Instant::now();
                         log(format!("view changed: {view}"));
@@ -149,9 +181,13 @@ pub async fn run(
         };
         drop(tx);
         match outcome {
-            None => return Ok(()),
-            Some(Ok(_)) => log("stream closed by the plugin".to_owned()),
-            Some(Err(status)) => log(format!("stream ended: {status}")),
+            Outcome::Stopped => return Ok(()),
+            Outcome::Ended(Ok(())) => log("stream closed by the plugin".to_owned()),
+            Outcome::Ended(Err(status)) => log(format!("stream ended: {status}")),
+            Outcome::Unanswered => log(format!(
+                "fabric manager unanswered for {:?}: closing the stream",
+                pacing.heartbeat
+            )),
         }
         // A queued view proves nothing, the plugin may have refused the
         // stream at once; a stream that lived a heartbeat did carry views,
@@ -165,6 +201,15 @@ pub async fn run(
         pause(backoff, &stop).await;
     }
     Ok(())
+}
+
+/// Why a stream ended.
+enum Outcome {
+    Stopped,
+    /// The plugin closed it, cleanly or with a status.
+    Ended(Result<(), tonic::Status>),
+    /// Fabric Manager stopped answering; this side closed it.
+    Unanswered,
 }
 
 async fn pause(duration: Duration, stop: &CancellationToken) {
@@ -579,23 +624,25 @@ mod tests {
                 >= 2,
             "{log:?}"
         );
-        assert_eq!(reads, 0, "no read without a stream");
+        assert!(reads >= 1, "the view in hand is read before each connect");
     }
 
     #[tokio::test]
-    async fn a_source_error_keeps_the_stream_open() {
+    async fn a_failed_read_within_a_heartbeat_keeps_the_stream() {
         let plugin = plugin("t", false).await;
         let target = Target {
             endpoint: plugin.endpoint.clone(),
             token: Some("t".into()),
         };
+        // The second read, the first one inside the stream, fails; the
+        // heartbeat is far away, so the stream stays and the next read sends.
         let mut n = 0;
         let mut source = move || -> Result<FabricView, Box<dyn Error>> {
             n += 1;
-            if n == 1 {
+            if n == 2 {
                 Err("fm unavailable".into())
             } else {
-                Ok(view("", &[5]))
+                Ok(view("", &[n]))
             }
         };
         let stop = CancellationToken::new();
@@ -603,6 +650,7 @@ mod tests {
         let waiter = plugin.recorder.clone();
         let stopper = stop.clone();
         tokio::spawn(async move {
+            waiter.got_one.notified().await;
             waiter.got_one.notified().await;
             stopper.cancel();
         });
@@ -621,7 +669,104 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(plugin.recorder.views.lock().unwrap().len(), 1);
+        assert_eq!(
+            *plugin.recorder.views.lock().unwrap(),
+            [view("", &[1]), view("", &[3])]
+        );
+        plugin.stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_fabric_manager_closes_the_stream_until_it_answers() {
+        let plugin = plugin("t", false).await;
+        let target = Target {
+            endpoint: plugin.endpoint.clone(),
+            token: Some("t".into()),
+        };
+        // Answers, falls silent for longer than a heartbeat, answers again
+        // with a different view.
+        let start = std::time::Instant::now();
+        let mut source = move || -> Result<FabricView, Box<dyn Error>> {
+            match start.elapsed().as_millis() {
+                0..=39 => Ok(view("", &[1])),
+                40..=299 => Err("fm restarting".into()),
+                _ => Ok(view("", &[2])),
+            }
+        };
+        let pacing = Pacing {
+            poll: Duration::from_millis(20),
+            heartbeat: Duration::from_millis(100),
+            backoff_max: Duration::from_millis(50),
+        };
+        let stop = CancellationToken::new();
+        let mut log = Vec::new();
+        let waiter = plugin.recorder.clone();
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            loop {
+                waiter.got_one.notified().await;
+                if waiter.views.lock().unwrap().last() == Some(&view("", &[2])) {
+                    break;
+                }
+            }
+            stopper.cancel();
+        });
+        run(&target, &mut source, pacing, stop, &mut |line| {
+            log.push(line)
+        })
+        .await
+        .unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l == "fabric manager unanswered for 100ms: closing the stream"),
+            "{log:?}"
+        );
+        assert!(
+            log.iter()
+                .filter(|l| l.starts_with("publishing to"))
+                .count()
+                >= 2,
+            "{log:?}"
+        );
+        let views = plugin.recorder.views.lock().unwrap().clone();
+        assert_eq!(views.first(), Some(&view("", &[1])));
+        assert_eq!(views.last(), Some(&view("", &[2])));
+        plugin.stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_stream_opens_only_with_a_view() {
+        let plugin = plugin("t", false).await;
+        let target = Target {
+            endpoint: plugin.endpoint.clone(),
+            token: Some("t".into()),
+        };
+        let mut n = 0;
+        let mut source = move || -> Result<FabricView, Box<dyn Error>> {
+            n += 1;
+            if n <= 2 {
+                Err("fm not up".into())
+            } else {
+                Ok(view("", &[9]))
+            }
+        };
+        let stop = CancellationToken::new();
+        let mut log = Vec::new();
+        let waiter = plugin.recorder.clone();
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            waiter.got_one.notified().await;
+            stopper.cancel();
+        });
+        run(&target, &mut source, fast(), stop, &mut |line| {
+            log.push(line)
+        })
+        .await
+        .unwrap();
+        let first_error = log.iter().position(|l| l == "fabric manager: fm not up");
+        let opened = log.iter().position(|l| l.starts_with("publishing to"));
+        assert!(first_error < opened, "{log:?}");
+        assert_eq!(*plugin.recorder.views.lock().unwrap(), [view("", &[9])]);
         plugin.stop.cancel();
     }
 }

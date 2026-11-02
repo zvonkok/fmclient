@@ -87,6 +87,7 @@ pub struct FmConnection {
     handle: ffi::FmHandle,
 }
 
+#[derive(Clone, Copy)]
 pub enum FmAddress<'a> {
     Tcp(&'a str),
     Unix(&'a str),
