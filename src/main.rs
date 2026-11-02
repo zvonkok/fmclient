@@ -55,12 +55,14 @@ struct Cli {
     #[arg(short = 's', long = "unix-domain-socket", value_name = "PATH")]
     unix_socket: Option<String>,
 
-    /// vsock address (CID:PORT) for host-to-guest VM communication.
+    /// vsock address (CID:PORT) of Fabric Manager inside a VM, for the host.
     ///
-    /// Overrides --hostname and --unix-domain-socket when specified.
-    /// Requires FM_CMD_VSOCK_CID and FM_CMD_VSOCK_PORT_NUMBER in guest FM configuration.
-    #[arg(short = 'v', long, value_name = "CID:PORT")]
-    vsock: Option<String>,
+    /// Without a value, the Service VM's contract address: the deterministic
+    /// CID kata runtime-rs gives it and FM's default port. Overrides
+    /// --hostname and --unix-domain-socket. Needs FM listening on vsock
+    /// (NVRC: nvrc.fm.vsock=on).
+    #[arg(short = 'v', long, value_name = "CID:PORT", num_args = 0..=1)]
+    vsock: Option<Option<String>>,
 
     /// Query all NVLink failed devices
     #[arg(short = 'g', long = "get-nvlink-failed-devices")]
@@ -211,8 +213,13 @@ fn output<T: types::Render>(
 fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
     let lib = FmLib::init()?;
 
-    let address = if let Some(ref addr) = cli.vsock {
-        FmAddress::Vsock(addr)
+    let service_vm = format!(
+        "{}:{}",
+        pcilibs_rs::fabric::SERVICE_VM_CID,
+        pcilibs_rs::fabric::FM_VSOCK_PORT
+    );
+    let address = if let Some(ref vsock) = cli.vsock {
+        FmAddress::Vsock(vsock.as_deref().unwrap_or(&service_vm))
     } else if let Some(ref path) = cli.unix_socket {
         FmAddress::Unix(path)
     } else {
