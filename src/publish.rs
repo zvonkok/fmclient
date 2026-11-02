@@ -94,9 +94,9 @@ pub async fn run(
         // No stream without a view: an open stream tells the plugin the view
         // is current, which a publisher that cannot read Fabric Manager
         // cannot say.
-        let first = loop {
+        let (first, mut answered) = loop {
             match source() {
-                Ok(view) => break view,
+                Ok(view) => break (view, tokio::time::Instant::now()),
                 Err(e) => {
                     log(format!("fabric manager: {e}"));
                     pause(backoff, &stop).await;
@@ -134,9 +134,10 @@ pub async fn run(
         ticker.tick().await;
         let opened = tokio::time::Instant::now();
         let mut sent = opened;
-        // When Fabric Manager last answered; the stream outlives a silence
-        // of one heartbeat and no longer.
-        let mut answered = opened;
+        // Whether the last read failed: the stream then has until one
+        // heartbeat after `answered`, and the heartbeat stops resending a
+        // view that may be stale.
+        let mut failing = false;
         let mut last: Option<FabricView> = None;
         if tx.try_send(first.clone()).is_ok() {
             log(format!("view changed: {first}"));
@@ -155,13 +156,12 @@ pub async fn run(
                         Ok(view) => view,
                         Err(e) => {
                             log(format!("fabric manager: {e}"));
-                            if answered.elapsed() >= pacing.heartbeat {
-                                break Outcome::Unanswered;
-                            }
+                            failing = true;
                             continue;
                         }
                     };
                     answered = tokio::time::Instant::now();
+                    failing = false;
                     if last.as_ref() != Some(&view) && tx.try_send(view.clone()).is_ok() {
                         sent = tokio::time::Instant::now();
                         log(format!("view changed: {view}"));
@@ -169,8 +169,13 @@ pub async fn run(
                     }
                 }
                 // Independent of the poll, so a long --interval does not
+                // lengthen the silence the publisher tolerates.
+                _ = tokio::time::sleep_until(answered + pacing.heartbeat), if failing => {
+                    break Outcome::Unanswered;
+                }
+                // Independent of the poll, so a long --interval does not
                 // lengthen the silence the plugin tolerates.
-                _ = tokio::time::sleep_until(sent + pacing.heartbeat), if last.is_some() => {
+                _ = tokio::time::sleep_until(sent + pacing.heartbeat), if last.is_some() && !failing => {
                     if let Some(view) = &last {
                         if tx.try_send(view.clone()).is_ok() {
                             sent = tokio::time::Instant::now();
@@ -265,12 +270,14 @@ mod tests {
     use tokio_stream::wrappers::UnixListenerStream;
     use tonic::{Response, Status, Streaming};
 
-    /// A plugin stand-in: records every view, wakes the test on each, and
-    /// optionally closes the stream after the first message.
+    /// A plugin stand-in: records every view, wakes the test on each and on
+    /// every stream's end, and optionally closes the stream after the first
+    /// message.
     #[derive(Default)]
     struct Recorder {
         views: Mutex<Vec<FabricView>>,
         got_one: Notify,
+        ended: Notify,
         close_after_first: bool,
     }
 
@@ -294,6 +301,7 @@ mod tests {
                     break;
                 }
             }
+            recorder.ended.notify_one();
             Ok(Response::new(PublishSummary {
                 views_received: received,
             }))
@@ -683,15 +691,15 @@ mod tests {
             endpoint: plugin.endpoint.clone(),
             token: Some("t".into()),
         };
-        // Answers, falls silent for longer than a heartbeat, answers again
-        // with a different view.
-        let start = std::time::Instant::now();
+        // Answers, falls silent, answers again with a different view; the
+        // test moves it between those as it observes the stream.
+        let phase = Arc::new(Mutex::new(Some(view("", &[1]))));
+        let fm = phase.clone();
         let mut source = move || -> Result<FabricView, Box<dyn Error>> {
-            match start.elapsed().as_millis() {
-                0..=39 => Ok(view("", &[1])),
-                40..=299 => Err("fm restarting".into()),
-                _ => Ok(view("", &[2])),
-            }
+            fm.lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| "fm restarting".into())
         };
         let pacing = Pacing {
             poll: Duration::from_millis(20),
@@ -703,6 +711,10 @@ mod tests {
         let waiter = plugin.recorder.clone();
         let stopper = stop.clone();
         tokio::spawn(async move {
+            waiter.got_one.notified().await;
+            *phase.lock().unwrap() = None;
+            waiter.ended.notified().await;
+            *phase.lock().unwrap() = Some(view("", &[2]));
             loop {
                 waiter.got_one.notified().await;
                 if waiter.views.lock().unwrap().last() == Some(&view("", &[2])) {
