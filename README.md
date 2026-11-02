@@ -183,7 +183,10 @@ With kata runtime-rs the Service VM gets a fixed CID through the
 `io.katacontainers.config.hypervisor.vsock_cid` annotation, and NVRC turns
 FM's vsock listener on when the kernel command line carries
 `nvrc.fm.vsock=on`. `deploy/service-vm-out-of-band.yaml` sets both; its
-container only holds the fabric, the host does the rest:
+container only holds the fabric, the host does the rest. The runtime-rs
+NVIDIA shim has no shared filesystem, so its pods need containerd's erofs
+snapshotter, which kata-deploy's `try-kata-nvidia-gpu.values.yaml` profile
+configures (`erofs-utils` on the host).
 
 ```sh
 # the view, on the plugin's host socket; no token, the socket's permissions decide
