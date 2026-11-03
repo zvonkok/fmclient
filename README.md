@@ -103,11 +103,11 @@ fmclient --publish --unit gpu
 
 The lists are read every `--interval` seconds (default 5) and sent when
 they change, or every 30 seconds unchanged so the plugin can tell a quiet
-publisher from a dead one. The stream opens only with a view in hand and is
-closed when Fabric Manager has not answered for a heartbeat, so a view the
-publisher cannot refresh is withdrawn rather than kept alive; publishing
-resumes once Fabric Manager answers again, over a fresh SDK connection, since
-the handle does not survive a Fabric Manager restart. A closed stream
+publisher from a dead one. The stream opens only once a reading exists and is
+closed when Fabric Manager has not answered for a heartbeat, so the plugin
+withdraws a view the publisher cannot refresh; publishing resumes once Fabric
+Manager answers again, over a fresh SDK connection, since the handle does not
+survive a Fabric Manager restart. A closed stream
 withdraws the view on the plugin side; this client reconnects with backoff.
 Log lines go to stderr.
 

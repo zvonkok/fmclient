@@ -10,10 +10,10 @@
 //! lists change, resends it on a heartbeat so the plugin can tell a quiet
 //! publisher from a dead one, and reconnects with backoff when the stream
 //! ends.  The open stream is the plugin's liveness signal: it withdraws the
-//! view when the stream closes.  So the stream opens only with a view in
-//! hand, and it is closed when Fabric Manager has not answered for a
-//! heartbeat: a view the publisher cannot refresh is withdrawn rather than
-//! kept alive, and publishing resumes once Fabric Manager answers again.
+//! view when the stream closes.  So the stream opens only once a reading
+//! exists, and it is closed when Fabric Manager has not answered for a
+//! heartbeat: the plugin withdraws a view the publisher cannot refresh, and
+//! publishing resumes once Fabric Manager answers again.
 //!
 //! On the host the plugin also listens on a unix socket; `unix://<path>`
 //! selects it, and no token is needed there because the socket's
@@ -74,8 +74,6 @@ impl Default for Pacing {
     }
 }
 
-/// Reads the view from Fabric Manager.  An error is logged and the read
-/// retried at the next poll; the stream stays open meanwhile.
 /// One reading of Fabric Manager's lists, or why there is none.
 pub type Reading = Result<FabricView, String>;
 

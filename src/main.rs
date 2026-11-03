@@ -304,24 +304,15 @@ fn publish_forever(
                         Duration::ZERO,
                     )?);
                 }
-                let read = {
-                    let conn = connection.as_ref().expect("connected above");
-                    conn.list_partitions().and_then(|partitions| {
-                        conn.list_unsupported_partitions()
-                            .map(|unsupported| (partitions, unsupported))
-                    })
-                };
-                match read {
-                    Ok((partitions, unsupported)) => Ok(FabricView {
-                        partitions: Some(partitions),
-                        unsupported: Some(unsupported),
-                        unit: unit.as_str().to_owned(),
-                    }),
-                    Err(e) => {
-                        connection = None;
-                        Err(e.into())
-                    }
+                let view = connection
+                    .as_ref()
+                    .expect("connected above")
+                    .fabric_view(unit.as_str());
+                // The handle does not survive a Fabric Manager restart.
+                if view.is_err() {
+                    connection = None;
                 }
+                Ok(view?)
             };
             publish::read_forever(source, pacing.poll, readings);
         });
