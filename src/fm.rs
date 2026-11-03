@@ -162,6 +162,15 @@ impl FmConnection {
         Ok(types::unsupported_partition_list(&list))
     }
 
+    /// The view the plugin is given: both partition lists and the unit word.
+    pub fn fabric_view(&self, unit: &str) -> Result<v1::FabricView, FmError> {
+        Ok(v1::FabricView {
+            partitions: Some(self.list_partitions()?),
+            unsupported: Some(self.list_unsupported_partitions()?),
+            unit: unit.to_owned(),
+        })
+    }
+
     pub fn activate_partition(&self, partition_id: u32) -> Result<(), FmError> {
         FmError::from_return(unsafe { ffi::fmActivateFabricPartition(self.handle, partition_id) })
     }

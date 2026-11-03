@@ -1,9 +1,8 @@
-# The Service VM for out-of-band operation: the host publishes the partition
-# view and activates partitions over vsock, so the container only holds the
-# fabric.  Needs kata runtime-rs with `vsock_cid` and NVRC with
-# `nvrc.fm.vsock`.  The CID is pcilibs-rs fabric::SERVICE_VM_CID; a test
-# keeps the two in step.  Never run this and the in-band manifest on one node:
-# the plugin keeps the newer stream and ends the other.
+# The Service VM for out-of-band operation: the host activates partitions
+# over vsock and fmclient publishes the view to the plugin's host socket, so
+# the container only holds the fabric.  Needs kata runtime-rs with
+# `vsock_cid` and NVRC with `nvrc.fm.vsock`.  The CID is pcilibs-rs
+# fabric::SERVICE_VM_CID; a test keeps the two in step.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:

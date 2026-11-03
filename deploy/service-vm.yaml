@@ -1,16 +1,18 @@
 # The Service VM: one Kata pod per fabric node that holds the node's NVSwitch
-# fabric and publishes Fabric Manager's partition view to kata-device-plugin.
+# fabric; Fabric Manager's partitions are activated through it.
 #
 # The guest image runs Fabric Manager in shared NVSwitch mode (NVRC's
 # servicevm modes); this container only carries fmclient, which reaches FM
-# on the guest's loopback.  kata-device-plugin injects the view endpoint and
-# token into this container's environment when it allocates the fabric, so
-# nothing here names them.  Partitions are activated in-band:
+# on the guest's loopback, and idles.  kata-device-plugin injects the view
+# endpoint and token into this container's environment when it allocates
+# the fabric, so nothing here names them.  Partitions are activated in-band:
 #
 #   kubectl -n kata-system exec ds/nvswitch-service-vm -- fmclient -l
 #   kubectl -n kata-system exec ds/nvswitch-service-vm -- fmclient -a 2
 #
-# and the plugin advertises each active partition within one poll.
+# fmclient publishes the resulting view to the plugin, which keeps it, and
+# the plugin advertises each active partition within one poll.  To hand out
+# single GPUs instead of whole partitions: fmclient --publish --unit=gpu.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -38,15 +40,7 @@ spec:
           # mismatch.  No image is published yet; this is the name the
           # release workflow will push.
           image: ghcr.io/zvonkok/fmclient:615
-          # The image's entrypoint is a shell; without this the flags below
-          # would reach bash, not fmclient.
-          command: ["fmclient"]
-          args:
-            - --publish
-            # How the plugin hands out the GPUs of active partitions:
-            # "partition" (one unit per partition, the default) or "gpu"
-            # (one unit per GPU, for an owner who holds the whole node).
-            - --unit=partition
+          command: ["sleep", "infinity"]
           resources:
             limits:
               nvidia.com/nvswitch-fabric: 1
