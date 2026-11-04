@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
+use pcilibs_rs::fabric;
 
 use fm::{FmAddress, FmConnection, FmLib};
 
@@ -87,22 +88,20 @@ struct Cli {
     #[arg(short = 'p', long = "set-activated-list", value_name = "IDS")]
     set_activated: Option<String>,
 
-    /// Publish the partition view to kata-device-plugin until stopped.
+    /// Publish the partition view to kata-device-plugin and exit.
     ///
-    /// Endpoint and token come from KATA_FABRIC_VIEW_ENDPOINT and
+    /// Every command that changes partitions publishes the result when it
+    /// knows where the plugin is; this resends the current view. Endpoint
+    /// and token come from KATA_FABRIC_VIEW_ENDPOINT and
     /// KATA_FABRIC_VIEW_TOKEN as the plugin injects them into the container
-    /// it gives the fabric to; --publish-to overrides the endpoint, which
-    /// is how a client on the host reaches the plugin's unix socket.
+    /// it gives the fabric to; with --vsock the plugin's host socket is the
+    /// default; --publish-to overrides both.
     #[arg(long)]
     publish: bool,
 
     /// Endpoint to publish to: http://HOST:PORT or unix:///PATH.
-    #[arg(long = "publish-to", value_name = "ENDPOINT", requires = "publish")]
+    #[arg(long = "publish-to", value_name = "ENDPOINT")]
     publish_to: Option<String>,
-
-    /// Seconds between reads of the partition lists while publishing.
-    #[arg(long, value_name = "SECS", default_value = "5")]
-    interval: u64,
 
     /// How the GPUs of active partitions are to be consumed: "partition"
     /// (one unit per active partition) or "gpu" (one unit per GPU).
@@ -229,6 +228,11 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
         FmAddress::Tcp(cli.hostname.as_deref().unwrap_or(DEFAULT_HOST))
     };
 
+    // Checked before Fabric Manager is touched: a bad --unit must not
+    // change the partitions and then fail to publish the result.
+    let unit = fabric::Unit::from_view(&cli.unit)
+        .ok_or_else(|| format!("--unit must be partition or gpu, got {:?}", cli.unit))?;
+
     let conn = FmConnection::connect(
         &lib,
         address,
@@ -236,6 +240,10 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(cli.timeout),
     )?;
 
+    let changed = cli.activate.is_some()
+        || cli.deactivate.is_some()
+        || cli.activate_with_vfs.is_some()
+        || cli.set_activated.is_some();
     if cli.list {
         let list = conn.list_partitions()?;
         output(out, &list, &cli.output)?;
@@ -255,54 +263,54 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
     } else if let Some(ref ids_str) = cli.set_activated {
         let ids = parse_partition_ids(ids_str)?;
         conn.set_activated_partitions(&ids)?;
-    } else if cli.publish {
-        publish_forever(&conn, &cli)?;
+    }
+
+    // The plugin keeps the last view it was given: the command that changed
+    // the partitions hands it the result when it knows where the plugin is,
+    // and --publish alone resends it.
+    match (cli.publish || changed, target(&cli)) {
+        (true, Some(target)) => publish_view(&conn, &target, &unit)?,
+        (true, None) if cli.publish => {
+            return Err(format!("no endpoint: set {} or --publish-to", fabric::ENDPOINT_ENV).into())
+        }
+        _ => {}
     }
 
     Ok(())
 }
 
-/// The view is read on the runtime's thread between awaits: the SDK calls
-/// are short and the connection handle is not Send, so a single thread is
-/// the simplest correct shape.
-fn publish_forever(conn: &FmConnection, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    use pcilibs_rs::fabric::{self, v1::FabricView};
-
-    let unit = fabric::Unit::from_view(&cli.unit)
-        .ok_or_else(|| format!("--unit must be partition or gpu, got {:?}", cli.unit))?;
-    let target = publish::Target::from_vars(
-        cli.publish_to
-            .clone()
-            .or_else(|| std::env::var(fabric::ENDPOINT_ENV).ok()),
-        std::env::var(fabric::TOKEN_ENV).ok(),
-    )
-    .ok_or_else(|| format!("no endpoint: set {} or --publish-to", fabric::ENDPOINT_ENV))?;
-    let pacing = publish::Pacing {
-        poll: Duration::from_secs(cli.interval.max(1)),
-        ..publish::Pacing::default()
-    };
-    let mut source = || -> Result<FabricView, Box<dyn std::error::Error>> {
-        Ok(FabricView {
-            partitions: Some(conn.list_partitions()?),
-            unsupported: Some(conn.list_unsupported_partitions()?),
-            unit: unit.as_str().to_owned(),
-        })
-    };
-    let stop = tokio_util::sync::CancellationToken::new();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
-        let on_signal = stop.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            on_signal.cancel();
+/// Where the plugin is: the flag, the environment the plugin injected into
+/// the fabric holder's container, or, for a client on the host that reaches
+/// Fabric Manager over vsock, the plugin's host socket.
+fn target(cli: &Cli) -> Option<publish::Target> {
+    let endpoint = cli
+        .publish_to
+        .clone()
+        .or_else(|| std::env::var(fabric::ENDPOINT_ENV).ok())
+        .or_else(|| {
+            cli.vsock
+                .is_some()
+                .then(|| format!("unix://{}", fabric::HOST_SOCKET))
         });
-        publish::run(&target, &mut source, pacing, stop, &mut |line| {
-            eprintln!("fmclient: {line}")
-        })
-        .await
-    })
+    publish::Target::from_vars(endpoint, std::env::var(fabric::TOKEN_ENV).ok())
+}
+
+/// A publish that fails after a partition changed exits non-zero: the
+/// change is in Fabric Manager and the node does not know yet.
+fn publish_view(
+    conn: &FmConnection,
+    target: &publish::Target,
+    unit: &fabric::Unit,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let view = conn.fabric_view(unit.as_str())?;
+    let line = format!("published to {}: {view}", target.endpoint);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(publish::publish(target, view))
+        .map_err(|e| format!("publish to {}: {e}", target.endpoint))?;
+    eprintln!("fmclient: {line}");
+    Ok(())
 }
 
 fn has_operation(cli: &Cli) -> bool {
