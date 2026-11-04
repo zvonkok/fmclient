@@ -228,6 +228,11 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
         FmAddress::Tcp(cli.hostname.as_deref().unwrap_or(DEFAULT_HOST))
     };
 
+    // Checked before Fabric Manager is touched: a bad --unit must not
+    // change the partitions and then fail to publish the result.
+    let unit = fabric::Unit::from_view(&cli.unit)
+        .ok_or_else(|| format!("--unit must be partition or gpu, got {:?}", cli.unit))?;
+
     let conn = FmConnection::connect(
         &lib,
         address,
@@ -264,7 +269,7 @@ fn run(cli: Cli, out: &mut File) -> Result<(), Box<dyn std::error::Error>> {
     // the partitions hands it the result when it knows where the plugin is,
     // and --publish alone resends it.
     match (cli.publish || changed, target(&cli)) {
-        (true, Some(target)) => publish_view(&conn, &target, &cli.unit)?,
+        (true, Some(target)) => publish_view(&conn, &target, &unit)?,
         (true, None) if cli.publish => {
             return Err(format!("no endpoint: set {} or --publish-to", fabric::ENDPOINT_ENV).into())
         }
@@ -295,10 +300,8 @@ fn target(cli: &Cli) -> Option<publish::Target> {
 fn publish_view(
     conn: &FmConnection,
     target: &publish::Target,
-    unit: &str,
+    unit: &fabric::Unit,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let unit = fabric::Unit::from_view(unit)
-        .ok_or_else(|| format!("--unit must be partition or gpu, got {unit:?}"))?;
     let view = conn.fabric_view(unit.as_str())?;
     let line = format!("published to {}: {view}", target.endpoint);
     tokio::runtime::Builder::new_current_thread()

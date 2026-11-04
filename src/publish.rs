@@ -60,9 +60,11 @@ pub async fn publish(target: &Target, view: FabricView) -> Result<(), Box<dyn Er
 }
 
 /// The connect timeout bounds an endpoint that drops packets, which the OS
-/// would otherwise let hang for minutes.
+/// would otherwise let hang for minutes; the request timeout bounds a plugin
+/// that accepts the connection and does not answer, so the command reports
+/// the publish as failed instead of waiting.
 async fn connect(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    const TIMEOUT: Duration = Duration::from_secs(10);
     let unix = endpoint.strip_prefix("unix://").map(str::to_owned);
     // For a socket the URI is a placeholder: the connector ignores it and
     // dials the path.
@@ -70,7 +72,9 @@ async fn connect(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
         .as_ref()
         .map_or(endpoint, |_| "http://[::]:0")
         .to_owned();
-    let endpoint = Endpoint::from_shared(uri)?.connect_timeout(CONNECT_TIMEOUT);
+    let endpoint = Endpoint::from_shared(uri)?
+        .connect_timeout(TIMEOUT)
+        .timeout(TIMEOUT);
     match unix {
         Some(path) => {
             endpoint
