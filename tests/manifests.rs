@@ -19,5 +19,6 @@ fn the_out_of_band_manifest_carries_the_contract_cid() {
 fn the_in_band_manifest_opens_no_vsock_listener() {
     assert!(!IN_BAND.contains("hypervisor.vsock_cid"));
     assert!(!IN_BAND.contains("nvrc.fm.vsock"));
-    assert!(IN_BAND.contains("--publish"));
+    // The container idles; fmclient runs through kubectl exec.
+    assert!(IN_BAND.contains(r#"command: ["sleep", "infinity"]"#));
 }

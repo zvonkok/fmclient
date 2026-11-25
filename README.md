@@ -65,7 +65,7 @@ fmclient -l
 #  ...
 
 # List partitions as JSON.  The schema is kata.fabric.v1 from pcilibs-rs,
-# the same types this client streams to kata-device-plugin, with fmpm's
+# the same types this client publishes to kata-device-plugin, with fmpm's
 # field names: partitionInfo[].partitionId, isActive, gpuInfo[].physicalId.
 # Only JSON reaches stdout; libnvfm's own log lines go to stderr.
 fmclient -l -o json
@@ -87,35 +87,43 @@ fmclient -t 0 -l
 
 In shared NVSwitch mode the plugin on the host advertises each active
 partition as a schedulable unit. It learns the partitions from this client
-over a gRPC stream:
+in one gRPC call and keeps that view until the next call or until the fabric
+changes hands. Every command that changes partitions (`-a`, `-d`,
+`--activate-with-vfs`, `--set-activated-list`) publishes the result when it
+knows where the plugin is; `--publish` alone resends the current view.
 
 ```sh
 # In the Service VM container.  The plugin injected the endpoint and token
 # into this container's environment when it allocated the fabric.
+fmclient -a 2
 fmclient --publish
 
-# On the host, through the plugin's unix socket; no token there.
+# On the host over vsock the plugin's unix socket is the default endpoint;
+# no token there, the socket's permissions decide.
+fmclient --vsock -a 2
+
+# Anywhere else, name the endpoint.
 fmclient --publish --publish-to unix:///var/run/kata-device-plugin/fabric-view.sock
 
 # Tell the plugin to hand out single GPUs instead of whole partitions.
 fmclient --publish --unit gpu
 ```
 
-The lists are read every `--interval` seconds (default 5) and sent when
-they change, or every 30 seconds unchanged so the plugin can tell a quiet
-publisher from a dead one. A closed stream withdraws the view on the plugin
-side; this client reconnects with backoff. Log lines go to stderr.
+Log lines go to stderr. A publish that fails after a partition changed exits
+non-zero: the change is in Fabric Manager and the node does not know yet; run
+`--publish` again.
 
 ## Deploying as the Service VM
 
 `deploy/service-vm.yaml` is the Service VM pod spec: a DaemonSet over the
 nodes whose fabric the provisioner bound, running this image under the Kata
 runtime class whose guest carries Fabric Manager, requesting
-`nvidia.com/nvswitch-fabric: 1` and publishing the view with `--publish`.
-The plugin injects the endpoint and token when it allocates the fabric.
-Activate partitions in-band with `kubectl exec ... -- fmclient -a <id>`; the
-plugin advertises each active partition within one poll. Pick `--unit=gpu`
-to have the plugin hand out single GPUs instead of whole partitions.
+`nvidia.com/nvswitch-fabric: 1`; its container idles. The plugin injects
+the endpoint and token when it allocates the fabric. Activate partitions
+in-band with `kubectl exec ... -- fmclient -a <id>`, which publishes the
+view; the plugin advertises each active partition within one poll.
+`fmclient --publish --unit=gpu` has the plugin hand out single GPUs instead
+of whole partitions.
 
 ## Running in Kata Containers / Service VMs
 
@@ -189,10 +197,8 @@ snapshotter, which kata-deploy's `try-kata-nvidia-gpu.values.yaml` profile
 configures (`erofs-utils` on the host).
 
 ```sh
-# the view, on the plugin's host socket; no token, the socket's permissions decide
-fmclient --vsock --publish --publish-to unix:///var/run/kata-device-plugin/fabric-view.sock
-
-# partitions, from the host
+# partitions, from the host; each change is published to the plugin's host
+# socket, where the socket's permissions decide and no token is needed
 fmclient --vsock -l
 fmclient --vsock -a 2
 ```
@@ -204,8 +210,7 @@ and FM's default port. Give `CID:PORT` for anything else.
 A vsock connect needs no privilege on the host, so with the listener on every
 host process can reach the FM API. That is the provider-owned model; where the
 host must have no Fabric Manager control path, run the in-band manifest, whose
-guest opens nothing. Never run both on one node: the plugin keeps the newer
-stream and ends the other.
+guest opens nothing.
 
 ## Fabric Manager Configuration Reference
 
